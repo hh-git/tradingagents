@@ -21,16 +21,39 @@ BACKEND_URL = "https://api.86gamestore.com/v1"
 DEFAULT_DEEP_MODEL = "gpt-5.5"
 DEFAULT_QUICK_MODEL = "gpt-5.4-mini"
 USER_AGENT = "HermesAgent/0.12.0"
+ENV_REF_RE = re.compile(r"\${([^}]+)}")
+PLACEHOLDER_SECRET_VALUES = {
+    "*",
+    "**",
+    "***",
+    "changeme",
+    "dummy",
+    "example",
+    "none",
+    "null",
+    "placeholder",
+    "your-api-key",
+    "your_api_key",
+}
 
 
 def parse_args() -> argparse.Namespace:
+    config = load_yaml_config(Path.home() / ".hermes" / "config.yaml") or {}
+    dotenv_values = read_hermes_dotenv(Path.home() / ".hermes" / "config.yaml")
+    model_config = config.get("model") if isinstance(config.get("model"), dict) else {}
+    configured_backend_url = normalize_base_url(model_config.get("base_url"), dotenv_values) if isinstance(model_config, dict) else ""
+
     parser = argparse.ArgumentParser(description="Run TradingAgentsGraph with Hermes/OKX defaults.")
     parser.add_argument("--instrument", required=True, help="OKX instrument ID, e.g. BTC-USDT or BTC-USDT-SWAP.")
     parser.add_argument("--date", required=True, help="Analysis date passed to TradingAgentsGraph, YYYY-MM-DD.")
     parser.add_argument("--output-language", required=True, help="Output language, e.g. Chinese or English.")
     parser.add_argument("--deep-model", help=f"Deep-think model. Default probes then prefers {DEFAULT_DEEP_MODEL}.")
     parser.add_argument("--quick-model", help=f"Quick-think model. Default probes then prefers {DEFAULT_QUICK_MODEL}.")
-    parser.add_argument("--backend-url", default=BACKEND_URL, help=f"Hermes-compatible base URL. Default: {BACKEND_URL}.")
+    parser.add_argument(
+        "--backend-url",
+        default=configured_backend_url or BACKEND_URL,
+        help=f"Hermes-compatible base URL. Default: configured model.base_url or {BACKEND_URL}.",
+    )
     parser.add_argument("--max-debate-rounds", type=int, default=1)
     parser.add_argument("--max-risk-rounds", type=int, default=1)
     parser.add_argument("--analysts", default="market,social,news,fundamentals")
@@ -60,25 +83,231 @@ def ensure_vendored_code_on_syspath() -> Path:
     return root
 
 
-def load_hermes_api_key() -> str | None:
-    env_key = os.environ.get("HERMES_API_KEY")
-    if env_key:
-        return env_key
+def read_hermes_dotenv(config_path: Path) -> dict[str, str]:
+    env_path = config_path.with_name(".env")
+    values: dict[str, str] = {}
+    if not env_path.exists():
+        return values
 
-    config_path = Path.home() / ".hermes" / "config.yaml"
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        value = value.strip()
+        if (
+            len(value) >= 2
+            and value[0] == value[-1]
+            and value[0] in {"'", '"'}
+        ):
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def expand_env_refs(value: str, dotenv_values: dict[str, str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        return os.environ.get(name, dotenv_values.get(name, match.group(0)))
+
+    return ENV_REF_RE.sub(replace, value)
+
+
+def has_usable_secret(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    cleaned = value.strip()
+    if len(cleaned) < 4:
+        return False
+    if ENV_REF_RE.search(cleaned):
+        return False
+    if cleaned.lower() in PLACEHOLDER_SECRET_VALUES:
+        return False
+    return True
+
+
+def secret_from_value(value: Any, dotenv_values: dict[str, str]) -> str:
+    if not isinstance(value, str):
+        return ""
+    candidate = expand_env_refs(value.strip(), dotenv_values).strip()
+    return candidate if has_usable_secret(candidate) else ""
+
+
+def secret_from_entry(entry: dict[str, Any], dotenv_values: dict[str, str]) -> str:
+    for key in ("api_key", "apiKey"):
+        candidate = secret_from_value(entry.get(key), dotenv_values)
+        if candidate:
+            return candidate
+
+    for key in ("key_env", "api_key_env", "keyEnv", "apiKeyEnv"):
+        env_name = entry.get(key)
+        if not isinstance(env_name, str) or not env_name.strip():
+            continue
+        candidate = os.environ.get(env_name.strip(), dotenv_values.get(env_name.strip(), ""))
+        if has_usable_secret(candidate):
+            return candidate.strip()
+
+    return ""
+
+
+def load_yaml_config(config_path: Path) -> dict[str, Any] | None:
+    try:
+        import yaml
+    except ImportError:
+        print("warning: PyYAML is unavailable; cannot read Hermes config.yaml", file=sys.stderr)
+        return None
+
     if not config_path.exists():
         return None
 
     try:
-        for line in config_path.read_text(encoding="utf-8").splitlines():
-            stripped = line.strip()
-            if stripped.startswith("api_key:") or stripped.startswith("HERMES_API_KEY:"):
-                key = stripped.split(":", 1)[1].strip().strip("'\"")
-                if key:
-                    os.environ["HERMES_API_KEY"] = key
-                    return key
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     except OSError as exc:
         print(f"warning: could not read {config_path}: {exc}", file=sys.stderr)
+        return None
+    except Exception as exc:
+        print(
+            f"warning: could not parse {config_path} as YAML ({type(exc).__name__})",
+            file=sys.stderr,
+        )
+        return None
+
+    return loaded if isinstance(loaded, dict) else None
+
+
+def normalize_provider_name(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower().replace(" ", "-")
+
+
+def normalize_base_url(value: Any, dotenv_values: dict[str, str]) -> str:
+    if not isinstance(value, str):
+        return ""
+    return expand_env_refs(value.strip(), dotenv_values).rstrip("/")
+
+
+def provider_match_score(
+    entry: dict[str, Any],
+    active_provider: str,
+    active_base_url: str,
+    dotenv_values: dict[str, str],
+    provider_key: str = "",
+) -> int:
+    names = {
+        normalize_provider_name(provider_key),
+        normalize_provider_name(entry.get("provider_key")),
+        normalize_provider_name(entry.get("name")),
+        normalize_provider_name(entry.get("provider")),
+    }
+    names.discard("")
+
+    aliases = set(names)
+    aliases.update(f"custom:{name}" for name in names)
+
+    provider_matches = bool(active_provider and active_provider in aliases)
+    entry_base_url = (
+        normalize_base_url(entry.get("base_url"), dotenv_values)
+        or normalize_base_url(entry.get("url"), dotenv_values)
+        or normalize_base_url(entry.get("api"), dotenv_values)
+    )
+    base_url_matches = bool(active_base_url and entry_base_url and active_base_url == entry_base_url)
+
+    if provider_matches and base_url_matches:
+        return 3
+    if provider_matches:
+        return 2
+    if base_url_matches:
+        return 1
+    return 0
+
+
+def iter_configured_provider_entries(config: dict[str, Any]):
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for provider_key, entry in providers.items():
+            if isinstance(entry, dict):
+                yield str(provider_key), entry
+
+    custom_providers = config.get("custom_providers")
+    if isinstance(custom_providers, list):
+        for entry in custom_providers:
+            if isinstance(entry, dict):
+                yield "", entry
+    elif isinstance(custom_providers, dict):
+        for provider_key, entry in custom_providers.items():
+            if isinstance(entry, dict):
+                yield str(provider_key), entry
+
+
+def configured_provider_api_key(
+    config: dict[str, Any],
+    active_provider: str,
+    active_base_url: str,
+    dotenv_values: dict[str, str],
+) -> str:
+    best_score = 0
+    best_key = ""
+
+    for provider_key, entry in iter_configured_provider_entries(config):
+        api_key = secret_from_entry(entry, dotenv_values)
+        if not api_key:
+            continue
+        score = provider_match_score(
+            entry,
+            active_provider,
+            active_base_url,
+            dotenv_values,
+            provider_key=provider_key,
+        )
+        if score > best_score:
+            best_score = score
+            best_key = api_key
+
+    return best_key
+
+
+def load_hermes_api_key(config_path: Path | None = None) -> str | None:
+    env_key = os.environ.get("HERMES_API_KEY")
+    if env_key:
+        return env_key
+
+    config_path = config_path or Path.home() / ".hermes" / "config.yaml"
+    config = load_yaml_config(config_path)
+    if not config:
+        return None
+
+    dotenv_values = read_hermes_dotenv(config_path)
+    model = config.get("model")
+    if isinstance(model, dict):
+        api_key = secret_from_entry(model, dotenv_values)
+        if api_key:
+            os.environ["HERMES_API_KEY"] = api_key
+            return api_key
+
+        active_provider = normalize_provider_name(model.get("provider"))
+        active_base_url = normalize_base_url(model.get("base_url"), dotenv_values)
+    else:
+        active_provider = ""
+        active_base_url = ""
+
+    api_key = configured_provider_api_key(
+        config,
+        active_provider,
+        active_base_url,
+        dotenv_values,
+    )
+    if api_key:
+        os.environ["HERMES_API_KEY"] = api_key
+        return api_key
 
     return None
 
@@ -254,4 +483,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

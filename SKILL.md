@@ -1,7 +1,7 @@
 ---
 name: tradingagents
 description: Use when the user wants to run a standalone packaged TradingAgentsGraph skill for OKX spot, swap, or futures analysis through a Hermes/OpenAI-compatible backend, without depending on a local TradingAgents repository.
-version: 2.0.0
+version: 2.1.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -14,154 +14,134 @@ metadata:
 
 ## Overview
 
-Run a standalone, skill-local TradingAgentsGraph runtime for deep OKX analysis.
-Use this for graph-based spot, perpetual/swap, or dated-futures research, not for order execution.
+Run a standalone, skill-local TradingAgentsGraph runtime for deep OKX analysis. Use it for graph-based spot, perpetual/swap, or dated-futures research; do **not** use it for order execution.
 
-This skill is self-contained: the runtime package is vendored under `vendor/` inside the skill directory. The launcher must not discover, import, or call `/home/chux/workspace/TradingAgents` or any other external TradingAgents repository at runtime.
+The skill is self-contained: runtime source is vendored under `vendor/`. The launcher must not discover, import, or call `/home/chux/workspace/TradingAgents` or any external TradingAgents checkout.
 
-## Standalone Layout
+## Layout
 
-Installed skill layout:
+Installed path: `~/.hermes/skills/okx-agent-skills/tradingagents`
 
-- `SKILL.md` — Hermes skill definition
-- `scripts/run_tradingagents.py` — standalone launcher
-- `vendor/tradingagents/` — vendored TradingAgents runtime package
-- `vendor/cli/` — vendored CLI support package when needed by runtime imports
-- `requirements.txt` — Python dependencies required by the vendored runtime
-- `references/usage.md` — install and operator notes
-- `references/standalone-packaging.md` — refactor checklist and verification commands for converting/re-validating the standalone packaged skill
-
-Install destination on this machine:
-
-- `~/.hermes/skills/okx-agent-skills/tradingagents`
-
-The installed skill must be runnable after copying this directory elsewhere.
+- `SKILL.md` — concise operator entrypoint
+- `scripts/run_tradingagents.py` — single-instrument standalone launcher
+- `scripts/run_tradingagents_batch.py` — multi-instrument launcher with subprocess isolation, per-symbol timeout, logs, and `summary.json`
+- `vendor/tradingagents/`, `vendor/cli/` — vendored runtime packages
+- `requirements.txt` — third-party Python deps for the runtime environment
+- `references/usage.md` — install/operator notes
+- `references/standalone-packaging.md` — standalone packaging verification
+- `references/batch-parallel-isolation.md` — regression recipe for the batch launcher
+- `references/operational-rules.md` — detailed trading/cron/live-position rules and security pitfalls
 
 ## When to Use
 
 - The user asks for TradingAgentsGraph or multi-agent trading analysis.
 - The user wants deep OKX analysis for spot, swap/perpetual, or dated futures.
 - The user wants a portable TradingAgents Hermes skill that can be copied or packaged independently.
-- Do not use for order placement, account operations, or quick one-shot market lookups.
+- Do not use for order placement, account operations, quick one-shot market lookups, or simple price checks.
 
-## Workflow
+## Quick Workflow
 
-1. Normalize the instrument:
+1. Normalize instrument IDs:
    - symbol only -> `<ASSET>-USDT`
    - swap/perp/contract -> `<ASSET>-USDT-SWAP`
    - dated futures only when explicitly requested
-
-2. Run the installed skill launcher directly:
-
-```bash
-python ~/.hermes/skills/okx-agent-skills/tradingagents/scripts/run_tradingagents.py \
-  --instrument ETH-USDT \
-  --date 2026-05-03 \
-  --output-language Chinese
-```
-
-3. If running from a packaged checkout before installation:
+2. Use the skill virtualenv when present:
 
 ```bash
-python hermes-skill/tradingagents/scripts/run_tradingagents.py \
-  --instrument ETH-USDT \
-  --date 2026-05-03 \
-  --output-language Chinese
+SKILL="$HOME/.hermes/skills/okx-agent-skills/tradingagents"
+PY="$SKILL/.venv/bin/python"
+[ -x "$PY" ] || PY=python3
 ```
 
-4. Optional knobs:
-   - `--deep-model`
-   - `--quick-model`
-   - `--backend-url`
-   - `--max-debate-rounds`
-   - `--max-risk-rounds`
-   - `--analysts`
-   - `--debug`
+3. Run a single instrument:
 
-5. Use `final_trade_decision` as the primary conclusion. When available, also inspect `decision_summary_json` for rating, target, stop, size, and horizon fields.
+```bash
+"$PY" "$SKILL/scripts/run_tradingagents.py" \
+  --instrument ETH-USDT-SWAP \
+  --date "$(date +%F)" \
+  --output-language Chinese \
+  --max-debate-rounds 1 \
+  --max-risk-rounds 1 \
+  --analysts market,social,news,fundamentals
+```
 
-## Hot-Contract Workflow
+4. For multi-symbol or cron-style work, prefer the batch launcher:
 
-When the user asks to analyze OKX "hot" contracts by rank (for example "热度8-10的合约"), interpret hotness as OKX SWAP 24h USD turnover unless the user specifies another ranking metric.
+```bash
+OUT="$HOME/.hermes/tmp/tradingagents-batch-$(date -u +%Y%m%dT%H%M%SZ)"
+"$PY" "$SKILL/scripts/run_tradingagents_batch.py" \
+  --instrument BTC-USDT-SWAP,ETH-USDT-SWAP,SOL-USDT-SWAP \
+  --date "$(date +%F)" \
+  --output-language Chinese \
+  --per-symbol-timeout 1800 \
+  --max-workers 2 \
+  --output-dir "$OUT"
+```
 
-1. Discover candidates with OKX market data first:
+5. Summarize `final_trade_decision` as the primary conclusion. When available, also use `decision_summary_json` for rating, target, stop, size, and horizon fields. For batches, read `<output-dir>/summary.json`.
+
+## Hot-Rank / Hot-Contract Workflow
+
+When the user asks to analyze OKX “hot” contracts by rank, interpret hotness as OKX SWAP 24h USD turnover unless they specify another ranking metric.
+
+If the request follows an already extracted OKX official website hot-rank table, preserve that exact Top N and the exact displayed instruments. Do **not** silently replace it with `okx market filter` results; use CLI market data only as supplemental context or clearly labeled fallback.
+
+Default SWAP discovery:
 
 ```bash
 export PATH="$HOME/.hermes/node/bin:$PATH"
 okx market filter --instType SWAP --sortBy volUsd24h --sortOrder desc --limit 10 --json
 ```
 
-2. Select the requested rank slice from the returned `rows[*].rank`, preserving exact `instId` values such as `LINK-USDT-SWAP`.
-3. Run the standalone skill launcher with the skill virtualenv when present:
+Fallback if `market filter` fails:
 
-```bash
-SKILL="$HOME/.hermes/skills/okx-agent-skills/tradingagents"
-PY="$SKILL/.venv/bin/python"
-[ -x "$PY" ] || PY=python3
-OUT="$HOME/.hermes/tmp/tradingagents-hot-$(date +%F)"
-mkdir -p "$OUT"
-"$PY" "$SKILL/scripts/run_tradingagents.py" \
-  --instrument LINK-USDT-SWAP \
-  --date "$(date +%F)" \
-  --output-language Chinese \
-  --max-debate-rounds 1 \
-  --max-risk-rounds 1 \
-  --analysts market,social,news,fundamentals \
-  2>&1 | tee "$OUT/LINK-USDT-SWAP.log"
-```
+1. Fetch `okx market tickers SWAP --json`.
+2. Restrict to the target universe, normally `*-USDT-SWAP` unless inverse/USD settlement was requested.
+3. Approximate 24h USD turnover as `last * volCcy24h` because ticker output lacks `volUsd24h`.
+4. Clearly label the ranking as a fallback approximation.
+5. Feed only exact `instId` values into TradingAgents.
 
-4. Summarize `final_trade_decision` and `decision_summary_json`, plus rank, last price, 24h change, `volUsd24h`, `oiUsd`, and funding rate from the market screener.
+For official hot-rank SPOT workflows, see `references/operational-rules.md` before analysis or trading decisions.
 
-### Fallback when `market filter` fails
+## Live Position Analysis Workflow
 
-If `okx market filter --instType SWAP --sortBy volUsd24h ...` fails due to transient network/API issues, do **not** stop the whole workflow immediately. Use this fallback:
+For “analyze my positions/holdings”:
 
-1. Fetch the full swap ticker set instead:
+1. Load/use OKX portfolio skill for authenticated account reads.
+2. Redact credentials: never show raw `okx config show --json` output.
+3. Gather open positions and account equity:
+   - `okx --profile live account positions --json`
+   - `okx --profile live account balance --json`
+   - `okx --profile live account asset-balance --valuation --json`
+4. Feed only open contract `instId` values into TradingAgents, preferably through the batch launcher.
+5. Add public market overlay for each open swap:
+   - `okx market ticker <instId> --json`
+   - `okx market funding-rate <instId> --json`
+   - `okx market orderbook <instId> --sz 5 --json`
+   - `okx market open-interest --instType SWAP --instId <instId> --json`
+6. Final summary must include: side, size, average price, mark/current price, notional as % equity, UPL, liquidation distance, funding, order-book spread, TradingAgents rating/target/stop, and whether the rating is actionable for the existing position.
 
-```bash
-okx market tickers SWAP --json
-```
-
-2. Restrict to the target universe explicitly (for most OKX hot-contract tasks, prefer `*-USDT-SWAP` unless the user asked for inverse/USD contracts or other settlement types).
-3. Approximate 24h USD turnover as `last * volCcy24h` for each returned row, because ticker output does not include `volUsd24h` directly.
-4. Sort descending by that approximation and clearly label the result as a **fallback approximation**, not the exact `market filter` ranking.
-5. Only feed exact `instId` values from that fallback ranking into TradingAgents.
-
-This keeps scheduled jobs moving when the screener endpoint is temporarily unavailable, while preserving an audit trail that the rank source was approximate rather than the canonical filter endpoint.
+Important: a `Hold` rating on an existing long means “hold/observe, no blind add,” not “open a new trade.” More live-position and security details are in `references/operational-rules.md`.
 
 ## Runtime Facts
 
 - standalone runtime root: `<skill_dir>/vendor`
-- the standalone skill may need a local virtualenv at `<skill_dir>/.venv`; if `ModuleNotFoundError` occurs for runtime deps such as `langgraph`, create/use that venv and install `requirements.txt` before retrying:
-  `python3 -m venv ~/.hermes/skills/okx-agent-skills/tradingagents/.venv && ~/.hermes/skills/okx-agent-skills/tradingagents/.venv/bin/python -m pip install -r ~/.hermes/skills/okx-agent-skills/tradingagents/requirements.txt`
-- for hot-contract rank requests, use OKX `market filter --instType SWAP --sortBy volUsd24h --sortOrder desc` to identify the contracts first, then feed the exact SWAP instIds into TradingAgents
-- if a TradingAgents batch appears idle with little stdout, inspect the per-instrument log files and child process tree rather than assuming it is stuck; graph output often arrives in large chunks after long model calls
-- backend_url default: `https://api.86gamestore.com/v1`
-- asset_universe: `okx`
+- asset universe: `okx`
 - default deep model: `gpt-5.5`
 - default quick model: `gpt-5.4-mini`
+- backend default: configured Hermes `model.base_url` when available, otherwise historical fallback `https://api.86gamestore.com/v1`
+- if `HERMES_API_KEY` is unset, the helper attempts to load it from `~/.hermes/config.yaml` and referenced `.env` values
 - probe `/models` before trusting model IDs
-- if `HERMES_API_KEY` is unset, the helper attempts to load it from `~/.hermes/config.yaml`
-- the wrapper injects `<skill_dir>/vendor` into `sys.path` before importing `tradingagents`
-- `--repo-root` and `$TRADINGAGENTS_REPO_ROOT` are intentionally unsupported because this skill must be standalone
-- before graph startup, the launcher must call `tradingagents.dataflows.config.set_config(config)` after setting `asset_universe="okx"`; otherwise module-level dataflow config can remain on yfinance and OKX instIds may trigger yfinance “possibly delisted” messages
-- OKX crypto runs should skip the equity-only pending outcome resolver that uses yfinance/SPY; otherwise past pending entries for OKX instIds can cause yfinance 404/no-timezone noise before the graph runs
-- in cron-style hot-contract workflows, treat `final_trade_decision` / `decision_summary_json` as the authoritative summary and ignore upstream `market_report` / debate-stage BUY noise when the final rating is weaker (for example `Hold` or `Underweight`)
-- when the rank-8-10 workflow says to use Finance MCP but MCP tools are unavailable, use the local Finance-Tracker service/SQLite in **read-only fallback mode** to confirm platform existence and gather historical overview/stats; do not create or mutate records unless an approved writer path is available or a real trade must be recorded through the supported service layer
-- before trimming an existing demo position on an `Underweight` conclusion, compare the current notional against the strategy cap and the recommendation strength; if the position is already small and the recommendation is only a moderate de-risking signal rather than a hard exit, it is acceptable to skip trading and report that no new executable action met the rules
-- in cron-style OKX **SPOT** top-volume workflows, if TradingAgents cannot produce `final_trade_decision` / `decision_summary_json` because the backend `/models` probe returns `HTTP 401 INVALID_API_KEY`, treat the analysis as unavailable and stop all new trade execution. Do **not** substitute ad-hoc directional guesses from price action or sentiment to force a trade.
-- for OKX **SPOT** hot-list workflows, prefer `okx market filter --instType SPOT --quoteCcy USDT --sortBy volUsd24h --sortOrder desc` so the universe stays in tradeable USDT spot pairs; metals/tokenized assets (for example `XAUT-USDT`, `PAXG-USDT`) may still appear and should be reported as returned by the screener unless the task explicitly excludes them
-- before reporting account context for demo SPOT cron runs, read `okx --profile demo account balance USDT --json`, `okx --profile demo account balance --json`, `okx --profile demo account asset-balance --valuation --json`, `okx --profile demo spot orders --json`, and `okx --profile demo spot fills --json`; use the combination to verify available USDT, holdings, open orders, and recent fills before deciding whether a sell is actually allowed
+- wrapper injects `<skill_dir>/vendor` into `sys.path` before importing `tradingagents`
+- `--repo-root` and `$TRADINGAGENTS_REPO_ROOT` are intentionally unsupported; portability depends on skill-local imports only
+- before graph startup, launcher must call `tradingagents.dataflows.config.set_config(config)` after setting `asset_universe="okx"`; otherwise OKX instIds may fall through to yfinance behavior
+- OKX crypto runs should skip equity-only pending outcome resolvers that use yfinance/SPY
+- if a batch appears idle, inspect per-instrument logs and child processes before assuming it is stuck; model output often arrives in large chunks
+- do not duplicate-retry later batch symbols merely because their logs still show only startup sections while the parent batch is running; wait for parent completion or configured per-symbol timeout and inspect `summary.json`
 
 ## Dependency Setup
 
-The skill vendors the TradingAgents source code, not third-party Python wheels. Install dependencies into the Python environment used to run the skill:
-
-```bash
-python -m pip install -r ~/.hermes/skills/okx-agent-skills/tradingagents/requirements.txt
-```
-
-For a disposable virtual environment:
+The skill vendors TradingAgents source, not third-party Python wheels. Install deps into the Python used to run the skill:
 
 ```bash
 cd ~/.hermes/skills/okx-agent-skills/tradingagents
@@ -171,38 +151,39 @@ python -m pip install -r requirements.txt
 python scripts/run_tradingagents.py --instrument BTC-USDT --date 2026-05-04 --output-language Chinese
 ```
 
+## GitHub Publishing
+
+This installed skill directory is itself a git repository pushed to:
+
+- `https://github.com/hh-git/tradingagents`
+
+When refreshing/pushing, work directly from `~/.hermes/skills/okx-agent-skills/tradingagents`. Keep `.venv/`, caches, credentials, databases, and local config untracked. Verify local HEAD matches remote `main` and that remote `SKILL.md`, `scripts/run_tradingagents.py`, `scripts/run_tradingagents_batch.py`, and `vendor/tradingagents/` are present.
+
 ## Common Pitfalls
 
-- `/models` success plus graph `401 INVALID_API_KEY` often means unsupported model IDs, not bad credentials.
-- Confirm runtime `data_vendors` resolves major categories to `okx`.
 - `BTC-USDT` and `BTC-USDT-SWAP` are different markets.
-- Do not add repo-root discovery back into the launcher; portability depends on importing only from the skill-local `vendor/` directory.
-- When converting a repo-backed skill into a standalone packaged skill, update both the source payload (for example `hermes-skill/tradingagents/`) and the installed Hermes copy under `~/.hermes/skills/...`; otherwise the current session may still use the stale installed skill.
-- Prefer installer copy mode (`bash scripts/install_skill.sh --copy --force`) for standalone packaging verification; symlink mode can hide missing vendored files because it still points at the development checkout.
-- Preserve unrelated local changes in the launcher during packaging refactors, such as model defaults, retry handling, and output summarization; merge them into the standalone rewrite instead of overwriting the file wholesale.
-- If Codex delegation is preferred but fails due to auth, usage limits, or sandbox prerequisites, continue the refactor directly and verify independently instead of stopping at the delegation error.
-- Pytest may be absent in the active Python environment; syntax/compile checks plus a launcher health check are acceptable for skill packaging changes.
-- Some symbols may fail transiently during the `/models` probe or graph startup with `ssl.SSLEOFError` / `UNEXPECTED_EOF_WHILE_READING`; retry the exact helper command at least once before treating the symbol as a hard failure.
-- For scheduled OKX demo trading runs, a TradingAgents `Hold` rating is **not** actionable even when target/stop are present; only `Buy` / `Long` / `Overweight` / `加仓` / `做多` should qualify for new long entries, while `Sell` / `Short` / `Underweight` only justify reduction if the demo account already holds that instrument.
-- In cron-style rank-8-10 workflows, check existing demo positions before trading: an `Underweight` conclusion on a symbol with **no current position** must not be converted into a fresh short.
-- When Finance MCP tools are unavailable but the local Finance-Tracker SQLite DB is present, it is acceptable to use read-only SQLite inspection as a fallback for platform existence and historical-context checks; however, do **not** create or mutate finance records through ad-hoc SQL unless the task explicitly authorizes a non-MCP fallback writer.
+- `final_trade_decision` / `decision_summary_json` are authoritative; do not trade from intermediate debate-stage reports.
+- `Hold` is not actionable for new entries; for existing positions it means hold/observe.
+- Some symbols may fail transiently during `/models` probe or graph startup with `ssl.SSLEOFError` / `UNEXPECTED_EOF_WHILE_READING`; retry the exact helper command at least once before treating as hard failure.
+- If TradingAgents cannot produce structured final decisions, report unavailability and execute no new trade.
+- For scheduled trading, Finance MCP unavailable means use local Finance-Tracker only in approved/read-only fallback modes as described in `references/operational-rules.md`.
+- Do not expose OKX credentials; redact profile output in the same command.
+- Preserve unrelated local changes during packaging or launcher refactors.
+- Pytest may be absent; syntax/compile checks plus launcher help/health checks are acceptable.
 
 ## Verification
-
-From a packaged checkout:
-
-```bash
-python -m py_compile hermes-skill/tradingagents/scripts/run_tradingagents.py
-python -m compileall -q hermes-skill/tradingagents/vendor/tradingagents hermes-skill/tradingagents/vendor/cli
-python hermes-skill/tradingagents/scripts/run_tradingagents.py --help
-```
 
 From an installed skill:
 
 ```bash
-python -m py_compile ~/.hermes/skills/okx-agent-skills/tradingagents/scripts/run_tradingagents.py
-python -m compileall -q ~/.hermes/skills/okx-agent-skills/tradingagents/vendor/tradingagents ~/.hermes/skills/okx-agent-skills/tradingagents/vendor/cli
-python ~/.hermes/skills/okx-agent-skills/tradingagents/scripts/run_tradingagents.py --help
+cd ~/.hermes/skills/okx-agent-skills/tradingagents
+python -m py_compile scripts/run_tradingagents.py
+python -m py_compile scripts/run_tradingagents_batch.py
+python -m compileall -q vendor/tradingagents vendor/cli
+python scripts/run_tradingagents.py --help
+python scripts/run_tradingagents_batch.py --help
 ```
 
-Runtime health check: the launcher should print `runtime_config` with `standalone: true`, `skill_root`, and `runtime_root`, then run TradingAgentsGraph and print `final_trade_decision` plus `decision_summary_json`.
+After modifying the batch launcher, also run the dummy mixed-outcome regression in `references/batch-parallel-isolation.md` to verify success, failure, and timeout can coexist while later symbols still complete.
+
+Runtime health check: launcher should print `runtime_config` with `standalone: true`, `skill_root`, and `runtime_root`, then run TradingAgentsGraph and print `final_trade_decision` plus `decision_summary_json`.
